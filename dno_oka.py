@@ -1,5 +1,7 @@
 '''Segmentacja naczyń krwionośnych siatkowki - filtr Sato'''
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend - tylko zapis do pliku
 import matplotlib.pyplot as plt
 import skimage
 from PIL import Image
@@ -11,14 +13,13 @@ CONFIG = {
     'sciezka_img': 'dno_oka/dataset/images/',
     'margin': 10,
     'sato_sigmas': range(1, 5),  # Zakresy skal dla detektora tubularnych struktur
-    'clahe_clip': 0.03,          # Adaptive histogram equalization
-    'adapthist_clip': 0.1,
+    'clahe_clip': 0.03,          # Adaptive histogram equalization clip limit
 }
 
-# Generowanie ścieżek - numery i rodzaje obrazów
-numery = ['01']
-choroby = ['h']
-obrazy = [f"{CONFIG['sciezka_img']}{num}_{ch}.JPG" for num in numery for ch in choroby]
+# Generowanie ścieżek 
+numery = ['01', '02', '03', '04', '05']  # Minimum 5 obrazów do testów
+choroby = ['h']  # = 'h' - healthy, 'g' - glaucoma, 'dr' - diabetic retinopathy
+obrazy = [f"{CONFIG['sciezka_img']}{num}_{ch}.jpg" for num in numery for ch in choroby]
 maski_expert = [f"dno_oka/dataset/manual1/{num}_{ch}.tif" for num in numery for ch in choroby]  
 
 # ===== WCZYTYWANIE =====
@@ -47,18 +48,20 @@ def zastosuj_sato(obraz, sigmas=range(1, 5)):
     '''Filtr Sato - detektor tubularnych struktur (naczynia retinalne)'''
     return skimage.filters.sato(obraz, sigmas=sigmas, black_ridges=True)
 
-def pojasn_obraz(obraz_norm):
-    '''Pojasnia obraz adaptacyjnie + power law transformation'''
-    pojasn = skimage.exposure.equalize_adapthist(obraz_norm, clip_limit=0.1, nbins=256)
-    return np.power(pojasn, 0.5)
-
 def binarnizuj_otsu(obraz_norm):
     '''Binarnizuje obraz automatycznym progiem Otsu'''
     otsu_thresh = skimage.filters.threshold_otsu(obraz_norm)
     return (obraz_norm > otsu_thresh).astype(np.uint8)
 
+def usun_artefakty(maska_bin):
+    '''Post-processing: morphological closing - wypełnia przerwy w liniach naczyń'''
+    # Closing = Dilation + Erosion - łączy przecięcia i wypełnia doliny
+    kernel = skimage.morphology.disk(2)  # Kernel o promieniu 2 pikseli
+    maska_closed = skimage.morphology.closing(maska_bin, kernel)
+    return maska_closed
+
 def segmentuj_naczynia(obraz_raw, margin=10):
-    '''Pipeline segmentacji: crop -> CLAHE -> Sato -> normalizacja -> binaryzacja'''
+    '''Pipeline segmentacji: crop -> CLAHE -> Sato -> normalizacja -> binaryzacja -> closing'''
     # Obcięcie marginesu (artefakty brzegowe)
     obraz_crop = obraz_raw[margin:-margin, margin:-margin]
     
@@ -72,108 +75,113 @@ def segmentuj_naczynia(obraz_raw, margin=10):
     obraz_norm = normalizuj(obraz_sato)
     obraz_bin = binarnizuj_otsu(obraz_norm)
     
+    # Post-processing: morphological closing - wypełnia przerwy w liniach
+    obraz_bin = usun_artefakty(obraz_bin)
+    
     return {
-        'sato_norm': obraz_norm,
-        'sato_pojasn': pojasn_obraz(obraz_norm),
         'segmentacja': obraz_bin,
-        'n_vessels': np.sum(obraz_bin),
-        'pct_vessels': np.sum(obraz_bin) / obraz_bin.size * 100,
     }
 
-# ===== WIZUALIZACJA =====
-def wyswietl_wyniki(wyniki, idx):
-    '''Wyświetla przetwarzanie: Sato znormalizowany, pojaśniony i binaryzację'''
-    _, axes = plt.subplots(1, 3, figsize=(18, 5))
-    
-    # Sato znormalizowany
-    axes[0].imshow(wyniki['sato_norm'], cmap='gray')
-    axes[0].set_title('Sato (znormalizowany)')
-    axes[0].axis('off')
-    
-    # Sato pojaśniony
-    axes[1].imshow(wyniki['sato_pojasn'], cmap='gray')
-    axes[1].set_title('Sato (pojaśniony)')
-    axes[1].axis('off')
-    
-    # Binaryzacja
-    axes[2].imshow(wyniki['segmentacja'], cmap='gray')
-    axes[2].set_title(f'Segmentacja - {wyniki["pct_vessels"]:.1f}% pikseli')
-    axes[2].axis('off')
-    
-    plt.tight_layout()
-    plt.savefig(f'sato_segmentacja_{idx+1}.png', dpi=100, bbox_inches='tight')
-    plt.show()
-    plt.close()
-    
-    print(f"Obraz {idx+1}: {wyniki['n_vessels']} pikseli naczyń ({wyniki['pct_vessels']:.2f}%)")
-
+# ===== METRYKI =====
 def policz_metryki(y_true, y_pred):
-    '''Oblicza metryki jakości segmentacji (sklearn.metrics)'''
+    '''Oblicza metryki jakości segmentacji dla niezrównoważonych klas (sklearn.metrics)'''
     # Konwersja do 1D arrays
     y_true_flat = np.asarray(y_true).flatten()
     y_pred_flat = np.asarray(y_pred).flatten()
     
-    # Metryki z sklearn
-    metryki = {
-        'accuracy': accuracy_score(y_true_flat, y_pred_flat),
-        'precision': precision_score(y_true_flat, y_pred_flat, zero_division=0),
-        'recall': recall_score(y_true_flat, y_pred_flat, zero_division=0),
-        'f1': f1_score(y_true_flat, y_pred_flat, zero_division=0),
-    }
-    
     # Macierz błędów
     cm = confusion_matrix(y_true_flat, y_pred_flat, labels=[0, 1])
     tn, fp, fn, tp = cm.ravel()
-    metryki.update({'tn': tn, 'fp': fp, 'fn': fn, 'tp': tp})
+    
+    # Podstawowe metryki z sklearn
+    accuracy = accuracy_score(y_true_flat, y_pred_flat)
+    precision = precision_score(y_true_flat, y_pred_flat, zero_division=0)
+    recall = recall_score(y_true_flat, y_pred_flat, zero_division=0)  # Sensitivity (TPR)
+    f1 = f1_score(y_true_flat, y_pred_flat, zero_division=0)
+    
+    # Miary dla danych niezrównoważonych
+    sensitivity = recall  # TPR = TP / (TP + FN)
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0  # TNR = TN / (TN + FP)
+    
+    # Średnia arytmetyczna - dla klasycznie niezrównoważonych danych
+    balanced_accuracy_arithmetic = (sensitivity + specificity) / 2
+    
+    # Średnia geometryczna - dla problemu niezrównoważonych klas
+    balanced_accuracy_geometric = np.sqrt(sensitivity * specificity)
+    
+    metryki = {
+        'accuracy': accuracy,
+        'precision': precision,
+        'sensitivity': sensitivity,  # recall / TPR
+        'specificity': specificity,   # TNR
+        'f1': f1,
+        'balanced_accuracy_arithmetic': balanced_accuracy_arithmetic,
+        'balanced_accuracy_geometric': balanced_accuracy_geometric,
+        'tp': tp, 'tn': tn, 'fp': fp, 'fn': fn
+    }
     
     return metryki
 
+# ===== WIZUALIZACJA =====
 def wyswietl_porownanie(maska_expert, segmentacja, metryki, idx):
-    '''Porównanie: expert (zielony) vs Sato (czerwony) vs pokrycie (żółty)'''
-    _, axes = plt.subplots(1, 3, figsize=(18, 5))
+    '''Porównanie: expert | Sato | mapa błędów'''
+    _, axes = plt.subplots(1, 3, figsize=(20, 6))
     
-    # Anotacje eksperckie
+    # Panel 1: Maska ekspercka
     axes[0].imshow(maska_expert, cmap='gray')
-    axes[0].set_title('Anotacje eksperckie')
+    axes[0].set_title('Maska ekspercka', fontsize=12, fontweight='bold')
     axes[0].axis('off')
     
-    # Segmentacja Sato
+    # Panel 2: Segmentacja Sato
     axes[1].imshow(segmentacja, cmap='gray')
-    axes[1].set_title('Segmentacja Sato')
+    axes[1].set_title('Segmentacja Sato', fontsize=12, fontweight='bold')
     axes[1].axis('off')
     
-    # Nałożenie RGB
-    overlay = np.zeros((*maska_expert.shape, 3))
-    overlay[maska_expert == 1] = [0, 1, 0]  # Expert = zielony
-    overlay[segmentacja == 1] = [1, 0, 0]   # Sato = czerwony
-    overlay[(maska_expert == 1) & (segmentacja == 1)] = [1, 1, 0]  # Pokrycie = żółty
+    # Panel 3: Mapa błędów - pokazuje co gdzieś poszło źle
+    # TP (zielony): Expert=1 i Sato=1
+    # FP (czerwony): Expert=0 ale Sato=1
+    # FN (niebieski): Expert=1 ale Sato=0
+    error_map = np.zeros((*maska_expert.shape, 3))
+    tp_mask = (maska_expert == 1) & (segmentacja == 1)
+    fp_mask = (maska_expert == 0) & (segmentacja == 1)
+    fn_mask = (maska_expert == 1) & (segmentacja == 0)
     
-    axes[2].imshow(overlay)
-    axes[2].set_title(f'Porównanie (F1={metryki["f1"]:.3f})')
+    error_map[tp_mask] = [0, 1, 0]      # TP = zielony
+    error_map[fp_mask] = [1, 0, 0]      # FP = czerwony
+    error_map[fn_mask] = [0, 0, 1]      # FN = niebieski
+    
+    axes[2].imshow(error_map)
+    axes[2].set_title(f'Mapa błędów: TP (zielony) | FP (czerwony) | FN (niebieski)\n' +
+                        f'TP={metryki["tp"]} | FP={metryki["fp"]} | FN={metryki["fn"]}\nF1={metryki["f1"]:.3f}', 
+                        fontsize=11, fontweight='bold')
     axes[2].axis('off')
     
     plt.tight_layout()
     plt.savefig(f'porownanie_sato_{idx+1}.png', dpi=100, bbox_inches='tight')
-    plt.show()
     plt.close()
     
     print(f"\nMetryki Obraz {idx+1}:")
-    print(f"  Accuracy:  {metryki['accuracy']:.3f}")
-    print(f"  Precision: {metryki['precision']:.3f}")
-    print(f"  Recall:    {metryki['recall']:.3f}")
-    print(f"  F1-score:  {metryki['f1']:.3f}")
+    print(f"  Macierz błędów: TP={metryki['tp']}, TN={metryki['tn']}, FP={metryki['fp']}, FN={metryki['fn']}")
+    print(f"  Accuracy:       {metryki['accuracy']:.3f}")
+    print(f"  Sensitivity:    {metryki['sensitivity']:.3f}  (czułość, recall, TPR)")
+    print(f"  Specificity:    {metryki['specificity']:.3f}  (swoistość, TNR)")
+    print(f"  Precision:      {metryki['precision']:.3f}")
+    print(f"  F1-score:       {metryki['f1']:.3f}")
+    print(f"  Balanced Acc (AM): {metryki['balanced_accuracy_arithmetic']:.3f}  (średnia arytmetyczna)")
+    print(f"  Balanced Acc (GM): {metryki['balanced_accuracy_geometric']:.3f}  (średnia geometryczna)")
 
 # ===== GŁÓWNA =====
 def main():
-    '''Główny pipeline: wczytaj -> preprocess -> Sato -> porównaj z expert'''
+    '''Główny pipeline: wczytaj -> preprocess -> Sato -> porównaj z expert (minimum 5 obrazów)'''
     obrazy_wczytane = [wczytaj_obraz(o) for o in obrazy]
     maski_expert_wczytane = [wczytaj_maske_expert(m) for m in maski_expert]
     
-    print("Segmentacja naczyń (Sato filter)...")
+    wyniki_wszystkie = []  # Agregacja wyników dla podsumowania
+    
+    print(f"Segmentacja naczyń (Sato filter) - {len(obrazy)} obrazów...\n")
     for idx, (obraz, maska_expert) in enumerate(zip(obrazy_wczytane, maski_expert_wczytane)):
         # Pipeline segmentacji
         wyniki = segmentuj_naczynia(obraz, margin=CONFIG['margin'])
-        wyswietl_wyniki(wyniki, idx)
         
         # Obcięcie maski eksperta do tego samego rozmiaru (bez marginesu)
         margin = CONFIG['margin']
@@ -189,9 +197,26 @@ def main():
         
         # Oblicz metryki segmentacji
         metryki = policz_metryki(maska_expert_crop.flatten(), segmentacja_crop.flatten())
+        wyniki_wszystkie.append(metryki)
         
         # Wyświetl porównanie z anotacjami
         wyswietl_porownanie(maska_expert_crop, segmentacja_crop, metryki, idx)
+    
+    # ===== PODSUMOWANIE =====
+    print("\n" + "="*70)
+    print("PODSUMOWANIE - Metryki srednie dla wszystkich obrazow")
+    print("="*70)
+    
+    keys = ['accuracy', 'sensitivity', 'specificity', 'precision', 'f1', 
+            'balanced_accuracy_arithmetic', 'balanced_accuracy_geometric']
+    labels = ['Accuracy', 'Sensitivity (czulosc)', 'Specificity (swoistosc)', 
+              'Precision', 'F1-score', 'Balanced Acc (AM)', 'Balanced Acc (GM)']
+    
+    for key, label in zip(keys, labels):
+        values = [m[key] for m in wyniki_wszystkie]
+        mean_val = np.mean(values)
+        std_val = np.std(values)
+        print(f"{label:30} {mean_val:.3f} +/- {std_val:.3f}")
     
 
 if __name__ == "__main__":
