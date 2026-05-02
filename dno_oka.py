@@ -13,7 +13,7 @@ CONFIG = {
     'sciezka_img': 'dno_oka/dataset/images/',
     'margin': 10,
     'sato_sigmas': range(1, 5),  # Zakresy skal dla detektora tubularnych struktur
-    'clahe_clip': 0.03,          # Adaptive histogram equalization clip limit
+    'clahe_clip': 0.03,          # Adaptive histogram equalization clip limit 
 }
 
 # Generowanie ścieżek 
