@@ -1,4 +1,4 @@
-'''Analiza dna oka - segmentacja naczyń krwionośnych'''
+'''Segmentacja naczyń krwionośnych siatkowki - filtr Sato'''
 import numpy as np
 import matplotlib.pyplot as plt
 import skimage
@@ -8,19 +8,17 @@ import tifffile
 # ===== KONFIGURACJA =====
 CONFIG = {
     'sciezka_img': 'dno_oka/dataset/images/',
-    'sciezka_mask': 'dno_oka/dataset/mask/',
     'margin': 10,
-    'frangi_sigmas': range(1, 3),
-    'frangi_scale_range': (1, 6),
-    'clahe_clip': 0.03,
+    'sato_sigmas': range(1, 5),  # Zakresy skal dla detektora tubularnych struktur
+    'clahe_clip': 0.03,          # Adaptive histogram equalization
     'adapthist_clip': 0.1,
 }
 
-# Generowanie ścieżek
+# Generowanie ścieżek - numery i rodzaje obrazów
 numery = ['01']
 choroby = ['h']
 obrazy = [f"{CONFIG['sciezka_img']}{num}_{ch}.JPG" for num in numery for ch in choroby]
-maski = [f"dno_oka/dataset/manual1/{num}_{ch}.tif" for num in numery for ch in choroby]  # Expert annotations
+maski_expert = [f"dno_oka/dataset/manual1/{num}_{ch}.tif" for num in numery for ch in choroby]  
 
 # ===== WCZYTYWANIE =====
 def wczytaj_obraz(sciezka):
@@ -28,13 +26,12 @@ def wczytaj_obraz(sciezka):
     with open(sciezka, 'rb') as f:
         return np.array(Image.open(f).convert('L'))
 
-def wczytaj_maske(sciezka):
-    '''Wczytuje expert annotation z manual1 - białe piksele (255) to naczynia'''
+def wczytaj_maske_expert(sciezka):
+    '''Wczytuje anotacje eksperckie z manual1 - białe piksele (255) to naczynia'''
     maska = tifffile.imread(sciezka)
     if maska.ndim == 3:
         maska = maska[:, :, 0]
-    # Białe piksele (255) to naczynia -> 1, czarne (0) to background -> 0
-    return (maska > 128).astype(np.uint8)
+    return (maska > 128).astype(np.uint8)  # 255 -> 1 (naczynie), 0 -> 0 (background)
 
 # ===== PRZETWARZANIE =====
 def normalizuj(obraz):
@@ -45,9 +42,9 @@ def zastosuj_clahe(obraz, clip_limit=0.03):
     '''Adaptive histogram equalization do preprocessing'''
     return skimage.exposure.equalize_adapthist(obraz, clip_limit=clip_limit)
 
-def zastosuj_frangi(obraz, sigmas=range(1, 3), scale_range=(1, 6)):
-    '''Filtr Frangi do detekcji naczyń'''
-    return skimage.filters.frangi(obraz, sigmas=sigmas, scale_range=scale_range)
+def zastosuj_sato(obraz, sigmas=range(1, 5)):
+    '''Filtr Sato - detektor tubularnych struktur (naczynia retinalne)'''
+    return skimage.filters.sato(obraz, sigmas=sigmas, black_ridges=True)
 
 def pojasn_obraz(obraz_norm):
     '''Pojasnia obraz adaptacyjnie + power law transformation'''
@@ -59,26 +56,24 @@ def binarnizuj_otsu(obraz_norm):
     otsu_thresh = skimage.filters.threshold_otsu(obraz_norm)
     return (obraz_norm > otsu_thresh).astype(np.uint8)
 
-def segmentuj_frangi(obraz_raw, margin=10):
-    '''Pełen pipeline Frangi: preprocessing -> detekcja -> binaryzacja'''
-    # Crop
+def segmentuj_naczynia(obraz_raw, margin=10):
+    '''Pipeline segmentacji: crop -> CLAHE -> Sato -> normalizacja -> binaryzacja'''
+    # Obcięcie marginesu (artefakty brzegowe)
     obraz_crop = obraz_raw[margin:-margin, margin:-margin]
     
-    # CLAHE
+    # Preprocessing - adaptive histogram equalization
     obraz_clahe = zastosuj_clahe(obraz_crop, clip_limit=CONFIG['clahe_clip'])
     
-    # Frangi
-    obraz_frangi = zastosuj_frangi(obraz_clahe, 
-                                    sigmas=CONFIG['frangi_sigmas'],
-                                    scale_range=CONFIG['frangi_scale_range'])
+    # Detektor struktur tubularnych (naczynia)
+    obraz_sato = zastosuj_sato(obraz_clahe, sigmas=CONFIG['sato_sigmas'])
     
-    # Normalizacja + binaryzacja
-    obraz_norm = normalizuj(obraz_frangi)
+    # Normalizacja do [0,1] i automatyczna binaryzacja (Otsu)
+    obraz_norm = normalizuj(obraz_sato)
     obraz_bin = binarnizuj_otsu(obraz_norm)
     
     return {
-        'frangi_norm': obraz_norm,
-        'frangi_pojasn': pojasn_obraz(obraz_norm),
+        'sato_norm': obraz_norm,
+        'sato_pojasn': pojasn_obraz(obraz_norm),
         'segmentacja': obraz_bin,
         'n_vessels': np.sum(obraz_bin),
         'pct_vessels': np.sum(obraz_bin) / obraz_bin.size * 100,
@@ -86,30 +81,29 @@ def segmentuj_frangi(obraz_raw, margin=10):
 
 # ===== WIZUALIZACJA =====
 def wyswietl_wyniki(wyniki, idx):
-    '''Wyświetla 3 porównawcze obrazy przetwarzania'''
+    '''Wyświetla przetwarzanie: Sato znormalizowany, pojaśniony i binaryzację'''
     _, axes = plt.subplots(1, 3, figsize=(18, 5))
     
-    # Znormalizowany
-    axes[0].imshow(wyniki['frangi_norm'], cmap='gray')
-    axes[0].set_title('Frangi (znormalizowany)')
+    # Sato znormalizowany
+    axes[0].imshow(wyniki['sato_norm'], cmap='gray')
+    axes[0].set_title('Sato (znormalizowany)')
     axes[0].axis('off')
     
-    # Pojaszczony
-    axes[1].imshow(wyniki['frangi_pojasn'], cmap='gray')
-    axes[1].set_title('Frangi (pojaszczony)')
+    # Sato pojaśniony
+    axes[1].imshow(wyniki['sato_pojasn'], cmap='gray')
+    axes[1].set_title('Sato (pojaśniony)')
     axes[1].axis('off')
     
-    # Segmentacja
+    # Binaryzacja
     axes[2].imshow(wyniki['segmentacja'], cmap='gray')
-    axes[2].set_title(f'Segmentacja naczyń - {wyniki["pct_vessels"]:.1f}%')
+    axes[2].set_title(f'Segmentacja - {wyniki["pct_vessels"]:.1f}% pikseli')
     axes[2].axis('off')
     
     plt.tight_layout()
-    plt.savefig(f'frangi_segmentacja_{idx+1}.png', dpi=100, bbox_inches='tight')
+    plt.savefig(f'sato_segmentacja_{idx+1}.png', dpi=100, bbox_inches='tight')
     plt.show()
     plt.close()
     
-    # Raport
     print(f"Obraz {idx+1}: {wyniki['n_vessels']} pikseli naczyń ({wyniki['pct_vessels']:.2f}%)")
 
 def policz_metryki(y_true, y_pred):
@@ -133,35 +127,34 @@ def policz_metryki(y_true, y_pred):
     }
 
 def wyswietl_porownanie(maska_expert, segmentacja, metryki, idx):
-    '''Wyświetla porównanie eksperckiej maski z segmentacją Frangi'''
+    '''Porównanie: expert (zielony) vs Sato (czerwony) vs pokrycie (żółty)'''
     _, axes = plt.subplots(1, 3, figsize=(18, 5))
     
-    # Maska ekspercka
+    # Anotacje eksperckie
     axes[0].imshow(maska_expert, cmap='gray')
-    axes[0].set_title('Maska ekspercka')
+    axes[0].set_title('Anotacje eksperckie')
     axes[0].axis('off')
     
-    # Segmentacja Frangi
+    # Segmentacja Sato
     axes[1].imshow(segmentacja, cmap='gray')
-    axes[1].set_title('Segmentacja Frangi')
+    axes[1].set_title('Segmentacja Sato')
     axes[1].axis('off')
     
-    # Nałożenie (expert: zielone, Frangi: czerwone, pokrycie: żółte)
+    # Nałożenie RGB
     overlay = np.zeros((*maska_expert.shape, 3))
-    overlay[maska_expert == 1] = [0, 1, 0]  # Expert = zielone
-    overlay[segmentacja == 1] = [1, 0, 0]   # Frangi = czerwone
-    overlay[(maska_expert == 1) & (segmentacja == 1)] = [1, 1, 0]  # Pokrycie = żółte
+    overlay[maska_expert == 1] = [0, 1, 0]  # Expert = zielony
+    overlay[segmentacja == 1] = [1, 0, 0]   # Sato = czerwony
+    overlay[(maska_expert == 1) & (segmentacja == 1)] = [1, 1, 0]  # Pokrycie = żółty
     
     axes[2].imshow(overlay)
-    axes[2].set_title(f'Nałożenie (F1={metryki["f1"]:.3f})')
+    axes[2].set_title(f'Porównanie (F1={metryki["f1"]:.3f})')
     axes[2].axis('off')
     
     plt.tight_layout()
-    plt.savefig(f'porownanie_{idx+1}.png', dpi=100, bbox_inches='tight')
+    plt.savefig(f'porownanie_sato_{idx+1}.png', dpi=100, bbox_inches='tight')
     plt.show()
     plt.close()
     
-    # Raport metryk
     print(f"\nMetryki Obraz {idx+1}:")
     print(f"  Accuracy:  {metryki['accuracy']:.3f}")
     print(f"  Precision: {metryki['precision']:.3f}")
@@ -170,32 +163,32 @@ def wyswietl_porownanie(maska_expert, segmentacja, metryki, idx):
 
 # ===== GŁÓWNA =====
 def main():
-    '''Główna funkcja: wczytaj -> przetwórz -> porównaj z expert maską'''
+    '''Główny pipeline: wczytaj -> preprocess -> Sato -> porównaj z expert'''
     obrazy_wczytane = [wczytaj_obraz(o) for o in obrazy]
-    maski_wczytane = [wczytaj_maske(m) for m in maski]
+    maski_expert_wczytane = [wczytaj_maske_expert(m) for m in maski_expert]
     
-    print("Segmentacja naczyń...")
-    for idx, (obraz, maska_expert) in enumerate(zip(obrazy_wczytane, maski_wczytane)):
-        # Przetwarzanie Frangi
-        wyniki = segmentuj_frangi(obraz, margin=CONFIG['margin'])
+    print("Segmentacja naczyń (Sato filter)...")
+    for idx, (obraz, maska_expert) in enumerate(zip(obrazy_wczytane, maski_expert_wczytane)):
+        # Pipeline segmentacji
+        wyniki = segmentuj_naczynia(obraz, margin=CONFIG['margin'])
         wyswietl_wyniki(wyniki, idx)
         
-        # Crop maski expertу do tego samego rozmiaru (z marginesu)
+        # Obcięcie maski eksperta do tego samego rozmiaru (bez marginesu)
         margin = CONFIG['margin']
         maska_expert_crop = maska_expert[margin:-margin, margin:-margin]
         segmentacja_crop = wyniki['segmentacja']
         
-        # Resize jeśli potrzebny
+        # Resize jeśli potrzebny (wyrównanie wymiarów)
         if maska_expert_crop.shape != segmentacja_crop.shape:
             maska_expert_crop = skimage.transform.resize(
                 maska_expert_crop, segmentacja_crop.shape, 
                 order=0, preserve_range=True, anti_aliasing=False
             ).astype(np.uint8)
         
-        # Oblicz metryki
+        # Oblicz metryki segmentacji
         metryki = policz_metryki(maska_expert_crop.flatten(), segmentacja_crop.flatten())
         
-        # Wyświetl porównanie
+        # Wyświetl porównanie z anotacjami
         wyswietl_porownanie(maska_expert_crop, segmentacja_crop, metryki, idx)
     
 
