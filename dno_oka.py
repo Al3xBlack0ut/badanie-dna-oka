@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import skimage
 from PIL import Image
 import tifffile
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
 
 # ===== KONFIGURACJA =====
 CONFIG = {
@@ -107,24 +108,25 @@ def wyswietl_wyniki(wyniki, idx):
     print(f"Obraz {idx+1}: {wyniki['n_vessels']} pikseli naczyń ({wyniki['pct_vessels']:.2f}%)")
 
 def policz_metryki(y_true, y_pred):
-    '''Oblicza metryki jakości segmentacji'''
-    tp = np.sum((y_true == 1) & (y_pred == 1))
-    tn = np.sum((y_true == 0) & (y_pred == 0))
-    fp = np.sum((y_true == 0) & (y_pred == 1))
-    fn = np.sum((y_true == 1) & (y_pred == 0))
+    '''Oblicza metryki jakości segmentacji (sklearn.metrics)'''
+    # Konwersja do 1D arrays
+    y_true_flat = np.asarray(y_true).flatten()
+    y_pred_flat = np.asarray(y_pred).flatten()
     
-    accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-    
-    return {
-        'accuracy': accuracy,
-        'precision': precision,
-        'recall': recall,
-        'f1': f1,
-        'tp': tp, 'tn': tn, 'fp': fp, 'fn': fn
+    # Metryki z sklearn
+    metryki = {
+        'accuracy': accuracy_score(y_true_flat, y_pred_flat),
+        'precision': precision_score(y_true_flat, y_pred_flat, zero_division=0),
+        'recall': recall_score(y_true_flat, y_pred_flat, zero_division=0),
+        'f1': f1_score(y_true_flat, y_pred_flat, zero_division=0),
     }
+    
+    # Macierz błędów
+    cm = confusion_matrix(y_true_flat, y_pred_flat, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+    metryki.update({'tn': tn, 'fp': fp, 'fn': fn, 'tp': tp})
+    
+    return metryki
 
 def wyswietl_porownanie(maska_expert, segmentacja, metryki, idx):
     '''Porównanie: expert (zielony) vs Sato (czerwony) vs pokrycie (żółty)'''
