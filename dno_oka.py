@@ -24,7 +24,7 @@ maski_expert = [f"dno_oka/dataset/manual1/{num}_{ch}.tif" for num in numery for 
 
 # ===== WCZYTYWANIE =====
 def wczytaj_obraz(sciezka):
-    '''Wczytuje obraz JPG i konwertuje do skali szarości'''
+    '''Wczytuje obraz z podanej ścieżki i konwertuje do skali szarości'''
     with open(sciezka, 'rb') as f:
         return np.array(Image.open(f).convert('L'))
 
