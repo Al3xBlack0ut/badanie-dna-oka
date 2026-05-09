@@ -11,6 +11,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import skimage
 import tifffile
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
 from PIL import Image
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
@@ -34,7 +37,14 @@ CONFIG = {
     'random_state': 42,
     'max_samples_per_class_per_image': 4500,
     'prediction_chunk_size': 150000,
+    'cnn_epochs': 4,
+    'cnn_batch_size': 512,
+    'cnn_prediction_chunk_size': 180000,
 }
+
+RESULTS_DIR = BASE_DIR / 'wyniki'
+COMPARISON_DIR = RESULTS_DIR / 'porownania'
+MASKS_DIR = RESULTS_DIR / 'maski'
 
 # Minimum 5 obrazów do testów klasycznego algorytmu.
 BASIC_TEST_IDS = ['01_h', '02_h', '03_h', '04_h', '05_h']
@@ -54,10 +64,12 @@ def sciezka_obrazu(image_id):
 
 
 def sciezka_maski_expert(image_id):
+    '''Zwraca ścieżkę do pliku maski eksperckiej, uwzględniając rozszerzenia tif/TIF.'''
     return DATASET_DIR / 'manual1' / f'{image_id}.tif'
 
 
 def sciezka_maski_pola(image_id):
+    '''Zwraca ścieżkę do pliku maski pola, uwzględniając rozszerzenia tif/TIF.'''
     return DATASET_DIR / 'mask' / f'{image_id}_mask.tif'
 
 
@@ -83,9 +95,10 @@ def wczytaj_maske(sciezka):
 
 
 def przytnij_margines(obraz, margin):
-    if margin <= 0:
+    '''Przycina margines z obrazu, jeśli margin > 0.'''
+    if margin == 0:
         return obraz
-    return obraz[margin:-margin, margin:-margin, ...] if obraz.ndim == 3 else obraz[margin:-margin, margin:-margin]
+    return obraz[margin:-margin, margin:-margin]
 
 
 # ===== PRZETWARZANIE OBRAZU =====
@@ -278,6 +291,157 @@ def predykcja_klasyfikatora(klasyfikator, rgb_raw, maska_pola_raw, margin=10):
     return usun_artefakty(segmentacja, maska_pola)
 
 
+# ===== GŁĘBOKA SIEĆ NEURONOWA CNN 5x5 =====
+def wyznacz_patche_cnn(kanaly, coords, patch_size=5):
+    '''Tworzy tensory patchy 5x5 dla sieci CNN z kanałów green_clahe, sato i sobel.'''
+    coords = np.asarray(coords, dtype=np.int64)
+    pad = patch_size // 2
+    rr = coords[:, 0]
+    cc = coords[:, 1]
+    patches_all = []
+
+    for nazwa in ('green_clahe', 'sato', 'sobel'):
+        kanal = kanaly[nazwa]
+        padded = np.pad(kanal, pad_width=pad, mode='reflect')
+        windows = skimage.util.view_as_windows(padded, (patch_size, patch_size))
+        patches_all.append(windows[rr, cc].astype(np.float32))
+
+    return np.stack(patches_all, axis=1)
+
+
+def zbuduj_zbior_uczacy_cnn(image_ids):
+    '''Buduje zbalansowany zbiór uczący patchy 5x5 dla głębokiej sieci CNN.'''
+    rng = np.random.default_rng(CONFIG['random_state'])
+    x_parts = []
+    y_parts = []
+
+    for image_id in image_ids:
+        rgb = przytnij_margines(wczytaj_obraz_rgb(sciezka_obrazu(image_id)), CONFIG['margin'])
+        expert = przytnij_margines(wczytaj_maske(sciezka_maski_expert(image_id)), CONFIG['margin']).astype(bool)
+        maska_pola = przytnij_margines(wczytaj_maske(sciezka_maski_pola(image_id)), CONFIG['margin']).astype(bool)
+
+        kanaly = przygotuj_kanaly_cech(rgb)
+        limit = CONFIG['max_samples_per_class_per_image']
+        pos_coords = losuj_wspolrzedne(expert, maska_pola, limit, rng)
+        neg_coords = losuj_wspolrzedne(~expert, maska_pola, len(pos_coords), rng)
+
+        coords = np.vstack([pos_coords, neg_coords])
+        y = np.concatenate([
+            np.ones(len(pos_coords), dtype=np.int64),
+            np.zeros(len(neg_coords), dtype=np.int64),
+        ])
+
+        order = rng.permutation(len(coords))
+        coords = coords[order]
+        y = y[order]
+
+        x_parts.append(wyznacz_patche_cnn(kanaly, coords, CONFIG['patch_size']))
+        y_parts.append(y)
+        print(f'  {image_id}: próbki CNN={len(y)} (naczynia={int(y.sum())}, tło={int((y == 0).sum())})')
+
+    return np.vstack(x_parts), np.concatenate(y_parts)
+
+
+class MalaSiecCNN(nn.Module):
+    '''Prosta głęboka sieć CNN klasyfikująca środkowy piksel patcha 5x5.'''
+
+    def __init__(self):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(32 * CONFIG['patch_size'] * CONFIG['patch_size'], 64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(64, 2),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+def wybierz_urzadzenie_torch():
+    '''Wybiera MPS na Apple Silicon, jeśli jest dostępne, w innym razie CPU.'''
+    if torch.backends.mps.is_available():
+        return torch.device('mps')
+    return torch.device('cpu')
+
+
+def trenuj_cnn(image_ids):
+    '''Trenuje głęboką sieć CNN PyTorch na patchach 5x5.'''
+    print('\nTrening głębokiej sieci CNN PyTorch na patchach 5x5...')
+    torch.manual_seed(CONFIG['random_state'])
+    np.random.seed(CONFIG['random_state'])
+
+    x_train, y_train = zbuduj_zbior_uczacy_cnn(image_ids)
+    dataset = TensorDataset(
+        torch.from_numpy(x_train).float(),
+        torch.from_numpy(y_train).long(),
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=CONFIG['cnn_batch_size'],
+        shuffle=True,
+    )
+
+    device = wybierz_urzadzenie_torch()
+    model = MalaSiecCNN().to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+    print(f'  Razem próbek: {len(y_train)}, kształt wejścia: {x_train.shape[1:]}, urządzenie: {device}')
+    model.train()
+    for epoch in range(CONFIG['cnn_epochs']):
+        total_loss = 0.0
+        correct = 0
+        total = 0
+
+        for x_batch, y_batch in loader:
+            x_batch = x_batch.to(device)
+            y_batch = y_batch.to(device)
+
+            optimizer.zero_grad()
+            logits = model(x_batch)
+            loss = criterion(logits, y_batch)
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item() * len(y_batch)
+            predictions = logits.argmax(dim=1)
+            correct += (predictions == y_batch).sum().item()
+            total += len(y_batch)
+
+        print(f'  Epoka {epoch + 1}/{CONFIG["cnn_epochs"]}: loss={total_loss / total:.4f}, accuracy={correct / total:.3f}')
+
+    return model
+
+
+def predykcja_cnn(model, rgb_raw, maska_pola_raw, margin=10):
+    '''Predykcja maski naczyń dla całego obrazu z użyciem głębokiej sieci CNN.'''
+    rgb = przytnij_margines(rgb_raw, margin)
+    maska_pola = przytnij_margines(maska_pola_raw, margin).astype(bool)
+    kanaly = przygotuj_kanaly_cech(rgb)
+
+    coords = np.column_stack(np.where(maska_pola))
+    segmentacja = np.zeros(maska_pola.shape, dtype=np.uint8)
+    device = next(model.parameters()).device
+    chunk = CONFIG['cnn_prediction_chunk_size']
+
+    model.eval()
+    with torch.no_grad():
+        for start in range(0, len(coords), chunk):
+            coords_chunk = coords[start:start + chunk]
+            x_chunk = wyznacz_patche_cnn(kanaly, coords_chunk, CONFIG['patch_size'])
+            x_tensor = torch.from_numpy(x_chunk).float().to(device)
+            predictions = model(x_tensor).argmax(dim=1).cpu().numpy().astype(np.uint8)
+            segmentacja[coords_chunk[:, 0], coords_chunk[:, 1]] = predictions
+
+    return usun_artefakty(segmentacja, maska_pola)
+
+
 # ===== METRYKI =====
 def policz_metryki(y_true, y_pred, valid_mask=None):
     '''Oblicza metryki jakości segmentacji dla niezrównoważonych klas.'''
@@ -318,14 +482,15 @@ def policz_metryki(y_true, y_pred, valid_mask=None):
     }
 
 
-def drukuj_metryki(metryki, label):
+def wypisz_metryki(metryki, label):
+    '''wypisuje metryki w czytelnej formie, wraz z macierzą pomyłek i liczbą TP/FP/FN/TN.'''
     print(f'\nMetryki {label}:')
     print('  Macierz pomyłek [[TN, FP], [FN, TP]]:')
     print(f"  {metryki['confusion_matrix']}")
     print(f"  TP={metryki['tp']}, TN={metryki['tn']}, FP={metryki['fp']}, FN={metryki['fn']}")
     print(f"  Accuracy:          {metryki['accuracy']:.3f}")
-    print(f"  Sensitivity:       {metryki['sensitivity']:.3f}  (czułość, TPR)")
-    print(f"  Specificity:       {metryki['specificity']:.3f}  (swoistość, TNR)")
+    print(f"  Sensitivity:       {metryki['sensitivity']:.3f}")
+    print(f"  Specificity:       {metryki['specificity']:.3f}")
     print(f"  Precision:         {metryki['precision']:.3f}")
     print(f"  F1-score:          {metryki['f1']:.3f}")
     print(f"  Balanced Acc (AM): {metryki['balanced_accuracy_arithmetic']:.3f}")
@@ -341,7 +506,15 @@ def naloz_segmentacje(rgb_crop, segmentacja):
     return np.clip(overlay, 0, 1)
 
 
-def wyswietl_porownanie(rgb_crop, maska_expert, segmentacja, metryki, idx, prefix, tytul):
+def zapisz_maske_binarnie(segmentacja, image_id, metoda):
+    '''Zapisuje binarną maskę odpowiedzi algorytmu jako PNG 0/255.'''
+    output_dir = MASKS_DIR / metoda
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f'{image_id}_maska.png'
+    Image.fromarray((segmentacja.astype(np.uint8) * 255)).save(output_path)
+
+
+def wyswietl_porownanie(rgb_crop, maska_expert, segmentacja, metryki, image_id, prefix, tytul):
     '''Zapisuje: obraz z overlayem | maska ekspert | segmentacja | mapa błędów.'''
     _, axes = plt.subplots(1, 4, figsize=(24, 6))
 
@@ -377,7 +550,8 @@ def wyswietl_porownanie(rgb_crop, maska_expert, segmentacja, metryki, idx, prefi
     axes[3].axis('off')
 
     plt.tight_layout()
-    plt.savefig(f'{prefix}_{idx + 1}.png', dpi=100, bbox_inches='tight')
+    COMPARISON_DIR.mkdir(parents=True, exist_ok=True)
+    plt.savefig(COMPARISON_DIR / f'{prefix}_{image_id}.png', dpi=100, bbox_inches='tight')
     plt.close()
 
 
@@ -398,8 +572,8 @@ def podsumuj_wyniki(wyniki_wszystkie, naglowek):
     ]
     labels = [
         'Accuracy',
-        'Sensitivity (czulosc)',
-        'Specificity (swoistosc)',
+        'Sensitivity',
+        'Specificity',
         'Precision',
         'F1-score',
         'Balanced Acc (AM)',
@@ -417,7 +591,7 @@ def uruchom_sato():
     wyniki_wszystkie = []
     print(f'Segmentacja naczyń filtrem Sato - {len(BASIC_TEST_IDS)} obrazów...')
 
-    for idx, image_id in enumerate(BASIC_TEST_IDS):
+    for image_id in BASIC_TEST_IDS:
         rgb = wczytaj_obraz_rgb(sciezka_obrazu(image_id))
         obraz = wczytaj_obraz(sciezka_obrazu(image_id))
         maska_expert = wczytaj_maske(sciezka_maski_expert(image_id))
@@ -431,13 +605,14 @@ def uruchom_sato():
 
         metryki = policz_metryki(maska_expert_crop, segmentacja_crop, maska_pola_crop)
         wyniki_wszystkie.append(metryki)
-        drukuj_metryki(metryki, f'Sato {image_id}')
+        wypisz_metryki(metryki, f'Sato {image_id}')
+        zapisz_maske_binarnie(segmentacja_crop, image_id, 'sato')
         wyswietl_porownanie(
             rgb_crop,
             maska_expert_crop,
             segmentacja_crop,
             metryki,
-            idx,
+            image_id,
             'porownanie_sato',
             'Segmentacja Sato',
         )
@@ -445,13 +620,13 @@ def uruchom_sato():
     podsumuj_wyniki(wyniki_wszystkie, 'PODSUMOWANIE SATO - metryki średnie dla 5 obrazów')
 
 
-def uruchom_klasyfikator():
+def uruchom_random_forest():
     '''Trenuje klasyfikator na cechach 5x5 i testuje go na niezależnym hold-out.'''
     klasyfikator = trenuj_klasyfikator(TRAIN_IDS)
     wyniki_wszystkie = []
 
     print(f'\nPredykcja klasyfikatora na hold-out - {len(HOLDOUT_TEST_IDS)} obrazów...')
-    for idx, image_id in enumerate(HOLDOUT_TEST_IDS):
+    for image_id in HOLDOUT_TEST_IDS:
         rgb = wczytaj_obraz_rgb(sciezka_obrazu(image_id))
         maska_expert = wczytaj_maske(sciezka_maski_expert(image_id))
         maska_pola = wczytaj_maske(sciezka_maski_pola(image_id))
@@ -463,13 +638,14 @@ def uruchom_klasyfikator():
 
         metryki = policz_metryki(maska_expert_crop, segmentacja, maska_pola_crop)
         wyniki_wszystkie.append(metryki)
-        drukuj_metryki(metryki, f'RandomForest 5x5 {image_id}')
+        wypisz_metryki(metryki, f'RandomForest 5x5 {image_id}')
+        zapisz_maske_binarnie(segmentacja, image_id, 'random_forest')
         wyswietl_porownanie(
             rgb_crop,
             maska_expert_crop,
             segmentacja,
             metryki,
-            idx,
+            image_id,
             'porownanie_rf',
             'RandomForest, cechy 5x5',
         )
@@ -483,7 +659,7 @@ def uruchom_klasyfikator():
 def main():
     '''main'''
     uruchom_sato()
-    uruchom_klasyfikator()
+    uruchom_random_forest()
 
 
 if __name__ == '__main__':
