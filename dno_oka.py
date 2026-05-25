@@ -5,8 +5,6 @@ from pathlib import Path
 
 os.environ.setdefault('MPLCONFIGDIR', str(Path(tempfile.gettempdir()) / 'medycynie_matplotlib'))
 
-import matplotlib
-matplotlib.use('Agg')  # Non-interactive backend - zapis wyników do plików.
 import matplotlib.pyplot as plt
 import numpy as np
 import skimage
@@ -37,9 +35,13 @@ CONFIG = {
     'random_state': 42,
     'max_samples_per_class_per_image': 4500,
     'prediction_chunk_size': 150000,
-    'cnn_epochs': 4,
+    'cnn_patch_size': 15,
+    'cnn_epochs': 8,
     'cnn_batch_size': 512,
-    'cnn_prediction_chunk_size': 180000,
+    'cnn_prediction_chunk_size': 50000,
+    'cnn_validation_fraction': 0.15,
+    'cnn_max_positive_samples_per_image': 2500,
+    'cnn_negative_to_positive_ratio': 2,
 }
 
 RESULTS_DIR = BASE_DIR / 'wyniki'
@@ -49,9 +51,18 @@ MASKS_DIR = RESULTS_DIR / 'maski'
 # Minimum 5 obrazów do testów klasycznego algorytmu.
 BASIC_TEST_IDS = ['01_h', '02_h', '03_h', '04_h', '05_h']
 
-# Hold-out: klasyfikator uczy się na jednych obrazach, a testowany jest na innych.
-TRAIN_IDS = ['01_h', '02_h', '03_h', '01_g', '02_g', '03_g', '01_dr', '02_dr', '03_dr']
-HOLDOUT_TEST_IDS = ['06_h', '07_h', '08_h', '09_h', '10_h']
+# Hold-out: klasyfikatory uczą się na 5 pierwszych obrazach każdego typu,
+# a testowane są na 2 ostatnich obrazach każdego typu.
+TRAIN_IDS = [
+    f'{idx:02d}_{wariant}'
+    for wariant in ['h', 'g', 'dr']
+    for idx in range(1, 6)
+]
+HOLDOUT_TEST_IDS = [
+    f'{idx:02d}_{wariant}'
+    for wariant in ['h', 'g', 'dr']
+    for idx in [14, 15]
+]
 
 
 def sciezka_obrazu(image_id):
@@ -216,6 +227,7 @@ def wyznacz_cechy_z_okien(kanaly, coords, patch_size=5):
 
 
 def losuj_wspolrzedne(mask_pos, mask_valid, limit, rng):
+    '''Losuje współrzędne pikseli z maski pozytywnej, ograniczając do limitu.'''
     coords = np.column_stack(np.where(mask_pos & mask_valid))
     if len(coords) > limit:
         coords = coords[rng.choice(len(coords), size=limit, replace=False)]
@@ -291,9 +303,9 @@ def predykcja_klasyfikatora(klasyfikator, rgb_raw, maska_pola_raw, margin=10):
     return usun_artefakty(segmentacja, maska_pola)
 
 
-# ===== GŁĘBOKA SIEĆ NEURONOWA CNN 5x5 =====
-def wyznacz_patche_cnn(kanaly, coords, patch_size=5):
-    '''Tworzy tensory patchy 5x5 dla sieci CNN z kanałów green_clahe, sato i sobel.'''
+# ===== GŁĘBOKA SIEĆ NEURONOWA CNN =====
+def wyznacz_patche_cnn(kanaly, coords, patch_size=15):
+    '''Tworzy tensory patchy dla sieci CNN z kanałów green_clahe, sato i sobel.'''
     coords = np.asarray(coords, dtype=np.int64)
     pad = patch_size // 2
     rr = coords[:, 0]
@@ -310,7 +322,7 @@ def wyznacz_patche_cnn(kanaly, coords, patch_size=5):
 
 
 def zbuduj_zbior_uczacy_cnn(image_ids):
-    '''Buduje zbalansowany zbiór uczący patchy 5x5 dla głębokiej sieci CNN.'''
+    '''Buduje zbiór uczący patchy dla CNN z większą liczbą przykładów tła.'''
     rng = np.random.default_rng(CONFIG['random_state'])
     x_parts = []
     y_parts = []
@@ -321,9 +333,10 @@ def zbuduj_zbior_uczacy_cnn(image_ids):
         maska_pola = przytnij_margines(wczytaj_maske(sciezka_maski_pola(image_id)), CONFIG['margin']).astype(bool)
 
         kanaly = przygotuj_kanaly_cech(rgb)
-        limit = CONFIG['max_samples_per_class_per_image']
-        pos_coords = losuj_wspolrzedne(expert, maska_pola, limit, rng)
-        neg_coords = losuj_wspolrzedne(~expert, maska_pola, len(pos_coords), rng)
+        pos_limit = CONFIG['cnn_max_positive_samples_per_image']
+        pos_coords = losuj_wspolrzedne(expert, maska_pola, pos_limit, rng)
+        neg_limit = int(len(pos_coords) * CONFIG['cnn_negative_to_positive_ratio'])
+        neg_coords = losuj_wspolrzedne(~expert, maska_pola, neg_limit, rng)
 
         coords = np.vstack([pos_coords, neg_coords])
         y = np.concatenate([
@@ -335,7 +348,7 @@ def zbuduj_zbior_uczacy_cnn(image_ids):
         coords = coords[order]
         y = y[order]
 
-        x_parts.append(wyznacz_patche_cnn(kanaly, coords, CONFIG['patch_size']))
+        x_parts.append(wyznacz_patche_cnn(kanaly, coords, CONFIG['cnn_patch_size']))
         y_parts.append(y)
         print(f'  {image_id}: próbki CNN={len(y)} (naczynia={int(y.sum())}, tło={int((y == 0).sum())})')
 
@@ -343,7 +356,7 @@ def zbuduj_zbior_uczacy_cnn(image_ids):
 
 
 class MalaSiecCNN(nn.Module):
-    '''Prosta głęboka sieć CNN klasyfikująca środkowy piksel patcha 5x5.'''
+    '''Prosta głęboka sieć CNN klasyfikująca środkowy piksel patcha.'''
 
     def __init__(self):
         super().__init__()
@@ -352,14 +365,19 @@ class MalaSiecCNN(nn.Module):
             nn.ReLU(),
             nn.Conv2d(16, 32, kernel_size=3, padding=1),
             nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
-            nn.Linear(32 * CONFIG['patch_size'] * CONFIG['patch_size'], 64),
+            nn.Linear(64, 32),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(64, 2),
+            nn.Linear(32, 2),
         )
 
     def forward(self, x):
+        '''Przekazuje dane przez sieć, zwracając logity dla dwóch klas.'''
         return self.model(x)
 
 
@@ -370,21 +388,68 @@ def wybierz_urzadzenie_torch():
     return torch.device('cpu')
 
 
+def policz_prawdopodobienstwa_cnn(model, loader, device):
+    '''Zwraca prawdopodobieństwa klasy naczynia i etykiety dla podanego loadera.'''
+    probs_parts = []
+    y_parts = []
+
+    model.eval()
+    with torch.no_grad():
+        for x_batch, y_batch in loader:
+            logits = model(x_batch.to(device))
+            probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
+            probs_parts.append(probs)
+            y_parts.append(y_batch.numpy())
+
+    return np.concatenate(probs_parts), np.concatenate(y_parts)
+
+
+def dobierz_prog_cnn(model, loader, device):
+    '''Dobiera próg decyzji CNN na walidacji, maksymalizując F1.'''
+    probs, y_true = policz_prawdopodobienstwa_cnn(model, loader, device)
+    najlepszy_prog = 0.5
+    najlepszy_f1 = -1.0
+
+    for prog in np.linspace(0.35, 0.90, 56):
+        y_pred = (probs >= prog).astype(np.uint8)
+        wynik_f1 = f1_score(y_true, y_pred, zero_division=0)
+        if wynik_f1 > najlepszy_f1:
+            najlepszy_f1 = wynik_f1
+            najlepszy_prog = float(prog)
+
+    return najlepszy_prog, najlepszy_f1
+
+
 def trenuj_cnn(image_ids):
-    '''Trenuje głęboką sieć CNN PyTorch na patchach 5x5.'''
-    print('\nTrening głębokiej sieci CNN PyTorch na patchach 5x5...')
+    '''Trenuje głęboką sieć CNN PyTorch na patchach obrazu.'''
+    print('\nTrening głębokiej sieci CNN PyTorch na większym zbiorze patchy obrazu...')
     torch.manual_seed(CONFIG['random_state'])
     np.random.seed(CONFIG['random_state'])
 
     x_train, y_train = zbuduj_zbior_uczacy_cnn(image_ids)
-    dataset = TensorDataset(
-        torch.from_numpy(x_train).float(),
-        torch.from_numpy(y_train).long(),
+    rng = np.random.default_rng(CONFIG['random_state'])
+    order = rng.permutation(len(y_train))
+    val_size = int(len(y_train) * CONFIG['cnn_validation_fraction'])
+    val_idx = order[:val_size]
+    train_idx = order[val_size:]
+
+    train_dataset = TensorDataset(
+        torch.from_numpy(x_train[train_idx]).float(),
+        torch.from_numpy(y_train[train_idx]).long(),
     )
-    loader = DataLoader(
-        dataset,
+    val_dataset = TensorDataset(
+        torch.from_numpy(x_train[val_idx]).float(),
+        torch.from_numpy(y_train[val_idx]).long(),
+    )
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=CONFIG['cnn_batch_size'],
         shuffle=True,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=CONFIG['cnn_batch_size'],
+        shuffle=False,
     )
 
     device = wybierz_urzadzenie_torch()
@@ -392,14 +457,17 @@ def trenuj_cnn(image_ids):
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-    print(f'  Razem próbek: {len(y_train)}, kształt wejścia: {x_train.shape[1:]}, urządzenie: {device}')
-    model.train()
+    print(
+        f'  Razem próbek: {len(y_train)}, trening={len(train_dataset)}, '
+        f'walidacja={len(val_dataset)}, kształt wejścia: {x_train.shape[1:]}, urządzenie: {device}'
+    )
     for epoch in range(CONFIG['cnn_epochs']):
         total_loss = 0.0
         correct = 0
         total = 0
 
-        for x_batch, y_batch in loader:
+        model.train()
+        for x_batch, y_batch in train_loader:
             x_batch = x_batch.to(device)
             y_batch = y_batch.to(device)
 
@@ -414,8 +482,17 @@ def trenuj_cnn(image_ids):
             correct += (predictions == y_batch).sum().item()
             total += len(y_batch)
 
-        print(f'  Epoka {epoch + 1}/{CONFIG["cnn_epochs"]}: loss={total_loss / total:.4f}, accuracy={correct / total:.3f}')
+        val_probs, val_true = policz_prawdopodobienstwa_cnn(model, val_loader, device)
+        val_pred = (val_probs >= 0.5).astype(np.uint8)
+        val_f1 = f1_score(val_true, val_pred, zero_division=0)
+        print(
+            f'  Epoka {epoch + 1}/{CONFIG["cnn_epochs"]}: '
+            f'loss={total_loss / total:.4f}, accuracy={correct / total:.3f}, val_f1@0.50={val_f1:.3f}'
+        )
 
+    prog, val_f1 = dobierz_prog_cnn(model, val_loader, device)
+    model.prog_decyzji = prog
+    print(f'  Wybrany próg decyzji CNN: {prog:.2f} (F1 walidacyjne={val_f1:.3f})')
     return model
 
 
@@ -434,9 +511,10 @@ def predykcja_cnn(model, rgb_raw, maska_pola_raw, margin=10):
     with torch.no_grad():
         for start in range(0, len(coords), chunk):
             coords_chunk = coords[start:start + chunk]
-            x_chunk = wyznacz_patche_cnn(kanaly, coords_chunk, CONFIG['patch_size'])
+            x_chunk = wyznacz_patche_cnn(kanaly, coords_chunk, CONFIG['cnn_patch_size'])
             x_tensor = torch.from_numpy(x_chunk).float().to(device)
-            predictions = model(x_tensor).argmax(dim=1).cpu().numpy().astype(np.uint8)
+            probs = torch.softmax(model(x_tensor), dim=1)[:, 1].cpu().numpy()
+            predictions = (probs >= model.prog_decyzji).astype(np.uint8)
             segmentacja[coords_chunk[:, 0], coords_chunk[:, 1]] = predictions
 
     return usun_artefakty(segmentacja, maska_pola)
@@ -484,9 +562,10 @@ def policz_metryki(y_true, y_pred, valid_mask=None):
 
 def wypisz_metryki(metryki, label):
     '''wypisuje metryki w czytelnej formie, wraz z macierzą pomyłek i liczbą TP/FP/FN/TN.'''
+    tn, fp, fn, tp = metryki['tn'], metryki['fp'], metryki['fn'], metryki['tp']
     print(f'\nMetryki {label}:')
     print('  Macierz pomyłek [[TN, FP], [FN, TP]]:')
-    print(f"  {metryki['confusion_matrix']}")
+    print(f'  [[{tn}  {fp}] [{fn}  {tp}]]')
     print(f"  TP={metryki['tp']}, TN={metryki['tn']}, FP={metryki['fp']}, FN={metryki['fn']}")
     print(f"  Accuracy:          {metryki['accuracy']:.3f}")
     print(f"  Sensitivity:       {metryki['sensitivity']:.3f}")
@@ -515,20 +594,12 @@ def zapisz_maske_binarnie(segmentacja, image_id, metoda):
 
 
 def wyswietl_porownanie(rgb_crop, maska_expert, segmentacja, metryki, image_id, prefix, tytul):
-    '''Zapisuje: obraz z overlayem | maska ekspert | segmentacja | mapa błędów.'''
-    _, axes = plt.subplots(1, 4, figsize=(24, 6))
+    '''Zapisuje: maska ekspert | porównanie segmentacji z maską ekspercką.'''
+    _, axes = plt.subplots(1, 2, figsize=(12, 6))
 
-    axes[0].imshow(naloz_segmentacje(rgb_crop, segmentacja))
-    axes[0].set_title('Wynik na obrazie wejściowym', fontsize=12, fontweight='bold')
+    axes[0].imshow(maska_expert, cmap='gray')
+    axes[0].set_title('Maska ekspercka', fontsize=12, fontweight='bold')
     axes[0].axis('off')
-
-    axes[1].imshow(maska_expert, cmap='gray')
-    axes[1].set_title('Maska ekspercka', fontsize=12, fontweight='bold')
-    axes[1].axis('off')
-
-    axes[2].imshow(segmentacja, cmap='gray')
-    axes[2].set_title(tytul, fontsize=12, fontweight='bold')
-    axes[2].axis('off')
 
     error_map = np.zeros((*maska_expert.shape, 3))
     tp_mask = (maska_expert == 1) & (segmentacja == 1)
@@ -539,15 +610,15 @@ def wyswietl_porownanie(rgb_crop, maska_expert, segmentacja, metryki, image_id, 
     error_map[fp_mask] = [1, 0, 0]
     error_map[fn_mask] = [0, 0, 1]
 
-    axes[3].imshow(error_map)
-    axes[3].set_title(
+    axes[1].imshow(error_map)
+    axes[1].set_title(
         f'TP zielony | FP czerwony | FN niebieski\n'
         f'TP={metryki["tp"]} | FP={metryki["fp"]} | FN={metryki["fn"]}\n'
-        f'F1={metryki["f1"]:.3f}',
+        f'{tytul} | F1={metryki["f1"]:.3f}',
         fontsize=11,
         fontweight='bold',
     )
-    axes[3].axis('off')
+    axes[1].axis('off')
 
     plt.tight_layout()
     COMPARISON_DIR.mkdir(parents=True, exist_ok=True)
@@ -585,7 +656,7 @@ def podsumuj_wyniki(wyniki_wszystkie, naglowek):
         print(f'{label:30} {np.mean(values):.3f} +/- {np.std(values):.3f}')
 
 
-# ===== GŁÓWNA =====
+# ===== GŁÓWNE =====
 def uruchom_sato():
     '''Uruchamia klasyczny algorytm przetwarzania obrazu na 5 obrazach.'''
     wyniki_wszystkie = []
@@ -656,10 +727,47 @@ def uruchom_random_forest():
     )
 
 
+def uruchom_cnn():
+    '''Trenuje głęboką sieć CNN i testuje ją na niezależnym hold-out.'''
+    model = trenuj_cnn(TRAIN_IDS)
+    wyniki_wszystkie = []
+
+    print(f'\nPredykcja CNN na hold-out - {len(HOLDOUT_TEST_IDS)} obrazów...')
+    for image_id in HOLDOUT_TEST_IDS:
+        rgb = wczytaj_obraz_rgb(sciezka_obrazu(image_id))
+        maska_expert = wczytaj_maske(sciezka_maski_expert(image_id))
+        maska_pola = wczytaj_maske(sciezka_maski_pola(image_id))
+
+        segmentacja = predykcja_cnn(model, rgb, maska_pola, margin=CONFIG['margin'])
+        rgb_crop = przytnij_margines(rgb, CONFIG['margin'])
+        maska_expert_crop = przytnij_margines(maska_expert, CONFIG['margin'])
+        maska_pola_crop = przytnij_margines(maska_pola, CONFIG['margin'])
+
+        metryki = policz_metryki(maska_expert_crop, segmentacja, maska_pola_crop)
+        wyniki_wszystkie.append(metryki)
+        wypisz_metryki(metryki, f'CNN PyTorch {CONFIG["cnn_patch_size"]}x{CONFIG["cnn_patch_size"]} {image_id}')
+        zapisz_maske_binarnie(segmentacja, image_id, 'cnn')
+        wyswietl_porownanie(
+            rgb_crop,
+            maska_expert_crop,
+            segmentacja,
+            metryki,
+            image_id,
+            'porownanie_cnn',
+            f'CNN PyTorch, patche {CONFIG["cnn_patch_size"]}x{CONFIG["cnn_patch_size"]}',
+        )
+
+    podsumuj_wyniki(
+        wyniki_wszystkie,
+        f'PODSUMOWANIE CNN PYTORCH {CONFIG["cnn_patch_size"]}x{CONFIG["cnn_patch_size"]} - niezależny zbiór hold-out',
+    )
+
+
 def main():
     '''main'''
     uruchom_sato()
     uruchom_random_forest()
+    uruchom_cnn()
 
 
 if __name__ == '__main__':
