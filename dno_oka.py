@@ -1,4 +1,4 @@
-'''Segmentacja naczyń krwionośnych siatkówki: Sato + klasyfikator cech 5x5.'''
+'''Segmentacja naczyń krwionośnych siatkówki: Sato, Random Forest i CNN.'''
 import os
 import tempfile
 from pathlib import Path
@@ -28,28 +28,29 @@ BASE_DIR = Path(__file__).resolve().parent
 DATASET_DIR = BASE_DIR / 'dataset'
 
 CONFIG = {
-    'margin': 10,
+    'margin': 0,
     'patch_size': 5,
     'sato_sigmas': range(1, 5),
     'clahe_clip': 0.03,
-    'random_state': 42,
+    'random_state': 13,
     'max_samples_per_class_per_image': 4500,
     'prediction_chunk_size': 150000,
-    'cnn_patch_size': 15,
-    'cnn_epochs': 8,
-    'cnn_batch_size': 512,
+    'cnn_patch_size': 17,
+    'cnn_epochs': 10,
+    'cnn_batch_size': 768,
+    'cnn_learning_rate': 0.0007,
+    'cnn_weight_decay': 0.0001,
     'cnn_prediction_chunk_size': 50000,
-    'cnn_validation_fraction': 0.15,
-    'cnn_max_positive_samples_per_image': 2500,
-    'cnn_negative_to_positive_ratio': 2,
+    'cnn_validation_fraction': 0.20,
+    'cnn_max_positive_samples_per_image': 3200,
+    'cnn_negative_to_positive_ratio': 2.5,
+    'cnn_threshold_min': 0.40,
+    'cnn_threshold_max': 0.95,
 }
 
 RESULTS_DIR = BASE_DIR / 'wyniki'
 COMPARISON_DIR = RESULTS_DIR / 'porownania'
 MASKS_DIR = RESULTS_DIR / 'maski'
-
-# Minimum 5 obrazów do testów klasycznego algorytmu.
-BASIC_TEST_IDS = ['01_h', '02_h', '03_h', '04_h', '05_h']
 
 # Hold-out: klasyfikatory uczą się na 5 pierwszych obrazach każdego typu,
 # a testowane są na 2 ostatnich obrazach każdego typu.
@@ -144,8 +145,8 @@ def usun_artefakty(maska_bin, maska_pola=None):
     return maska.astype(np.uint8)
 
 
-def segmentuj_naczynia(obraz_raw, maska_pola=None, margin=10):
-    '''Pipeline: crop -> CLAHE -> Sato -> normalizacja -> Otsu -> morfologia.'''
+def segmentuj_naczynia(obraz_raw, maska_pola=None, margin=0):
+    '''Pipeline: CLAHE -> Sato -> normalizacja -> Otsu -> morfologia.'''
     obraz_crop = przytnij_margines(obraz_raw, margin)
     maska_pola_crop = przytnij_margines(maska_pola, margin) if maska_pola is not None else None
 
@@ -170,7 +171,6 @@ def przygotuj_kanaly_cech(rgb_crop):
     blue = rgb_crop[:, :, 2]
     green_clahe = zastosuj_clahe(green, clip_limit=CONFIG['clahe_clip'])
     sato = normalizuj(zastosuj_sato(green_clahe, sigmas=CONFIG['sato_sigmas']))
-    sobel = normalizuj(skimage.filters.sobel(green_clahe))
 
     return {
         'red': red,
@@ -178,7 +178,6 @@ def przygotuj_kanaly_cech(rgb_crop):
         'blue': blue,
         'green_clahe': green_clahe,
         'sato': sato,
-        'sobel': sobel,
     }
 
 
@@ -285,7 +284,7 @@ def trenuj_klasyfikator(image_ids):
     return klasyfikator
 
 
-def predykcja_klasyfikatora(klasyfikator, rgb_raw, maska_pola_raw, margin=10):
+def predykcja_klasyfikatora(klasyfikator, rgb_raw, maska_pola_raw, margin=0):
     '''Predykcja maski naczyń dla całego obrazu z użyciem klasyfikatora.'''
     rgb = przytnij_margines(rgb_raw, margin)
     maska_pola = przytnij_margines(maska_pola_raw, margin).astype(bool)
@@ -304,15 +303,16 @@ def predykcja_klasyfikatora(klasyfikator, rgb_raw, maska_pola_raw, margin=10):
 
 
 # ===== GŁĘBOKA SIEĆ NEURONOWA CNN =====
-def wyznacz_patche_cnn(kanaly, coords, patch_size=15):
-    '''Tworzy tensory patchy dla sieci CNN z kanałów green_clahe, sato i sobel.'''
+def wyznacz_patche_cnn(kanaly, coords, patch_size=None):
+    '''Tworzy tensory patchy dla sieci CNN z kanałów green_clahe i sato.'''
+    patch_size = CONFIG['cnn_patch_size'] if patch_size is None else patch_size
     coords = np.asarray(coords, dtype=np.int64)
     pad = patch_size // 2
     rr = coords[:, 0]
     cc = coords[:, 1]
     patches_all = []
 
-    for nazwa in ('green_clahe', 'sato', 'sobel'):
+    for nazwa in ('green_clahe', 'sato'):
         kanal = kanaly[nazwa]
         padded = np.pad(kanal, pad_width=pad, mode='reflect')
         windows = skimage.util.view_as_windows(padded, (patch_size, patch_size))
@@ -361,7 +361,7 @@ class MalaSiecCNN(nn.Module):
     def __init__(self):
         super().__init__()
         self.model = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, padding=1),
+            nn.Conv2d(2, 16, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.Conv2d(16, 32, kernel_size=3, padding=1),
             nn.ReLU(),
@@ -410,7 +410,7 @@ def dobierz_prog_cnn(model, loader, device):
     najlepszy_prog = 0.5
     najlepszy_f1 = -1.0
 
-    for prog in np.linspace(0.35, 0.90, 56):
+    for prog in np.linspace(CONFIG['cnn_threshold_min'], CONFIG['cnn_threshold_max'], 56):
         y_pred = (probs >= prog).astype(np.uint8)
         wynik_f1 = f1_score(y_true, y_pred, zero_division=0)
         if wynik_f1 > najlepszy_f1:
@@ -455,11 +455,16 @@ def trenuj_cnn(image_ids):
     device = wybierz_urzadzenie_torch()
     model = MalaSiecCNN().to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=CONFIG['cnn_learning_rate'],
+        weight_decay=CONFIG['cnn_weight_decay'],
+    )
 
     print(
         f'  Razem próbek: {len(y_train)}, trening={len(train_dataset)}, '
-        f'walidacja={len(val_dataset)}, kształt wejścia: {x_train.shape[1:]}, urządzenie: {device}'
+        f'walidacja={len(val_dataset)}, kształt wejścia: {x_train.shape[1:]}, '
+        f'urządzenie: {device}, lr={CONFIG["cnn_learning_rate"]}'
     )
     for epoch in range(CONFIG['cnn_epochs']):
         total_loss = 0.0
@@ -496,7 +501,7 @@ def trenuj_cnn(image_ids):
     return model
 
 
-def predykcja_cnn(model, rgb_raw, maska_pola_raw, margin=10):
+def predykcja_cnn(model, rgb_raw, maska_pola_raw, margin=0):
     '''Predykcja maski naczyń dla całego obrazu z użyciem głębokiej sieci CNN.'''
     rgb = przytnij_margines(rgb_raw, margin)
     maska_pola = przytnij_margines(maska_pola_raw, margin).astype(bool)
@@ -658,11 +663,11 @@ def podsumuj_wyniki(wyniki_wszystkie, naglowek):
 
 # ===== GŁÓWNE =====
 def uruchom_sato():
-    '''Uruchamia klasyczny algorytm przetwarzania obrazu na 5 obrazach.'''
+    '''Uruchamia klasyczny algorytm przetwarzania obrazu na zbiorze hold-out.'''
     wyniki_wszystkie = []
-    print(f'Segmentacja naczyń filtrem Sato - {len(BASIC_TEST_IDS)} obrazów...')
+    print(f'Segmentacja naczyń filtrem Sato na hold-out - {len(HOLDOUT_TEST_IDS)} obrazów...')
 
-    for image_id in BASIC_TEST_IDS:
+    for image_id in HOLDOUT_TEST_IDS:
         rgb = wczytaj_obraz_rgb(sciezka_obrazu(image_id))
         obraz = wczytaj_obraz(sciezka_obrazu(image_id))
         maska_expert = wczytaj_maske(sciezka_maski_expert(image_id))
@@ -688,7 +693,7 @@ def uruchom_sato():
             'Segmentacja Sato',
         )
 
-    podsumuj_wyniki(wyniki_wszystkie, 'PODSUMOWANIE SATO - metryki średnie dla 5 obrazów')
+    podsumuj_wyniki(wyniki_wszystkie, 'PODSUMOWANIE SATO - niezależny zbiór hold-out')
 
 
 def uruchom_random_forest():
